@@ -7,7 +7,7 @@
 //! [`AcpCore`] is the protocol alone (lines in, lines and events out) so it's tested without a
 //! process; [`AcpConversation`] runs it against the agent through `craft_anything_platform`.
 
-use super::{McpCommand, display_for};
+use super::{MCP_NAME, McpCommand, display_for};
 use crate::model::Stop;
 use crate::{AgentEvent, Conversation, FailureKind, TurnFailure};
 use craft_anything_platform::sync::Mutex;
@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 /// Agents known to speak ACP, and the arguments that start them in that mode.
 pub const ACP_AGENTS: &[(&str, &[&str])] = &[
     ("gemini-cli", &["--experimental-acp"]),
-    ("qwen-code", &["--experimental-acp"]),
+    ("qwen-code", &["--acp"]),
+    ("antigravity", &["acp"]),
+    ("agy", &["acp"]),
     ("opencode", &["acp"]),
     ("goose", &["acp"]),
     ("hermes", &["acp"]),
@@ -94,6 +96,13 @@ pub struct ModelMetadata {
 /// An ACP tool call in the approval policy's shape.
 fn policy_action(call: &Value) -> (String, Value) {
     let s = |p: &str| call.pointer(p).and_then(Value::as_str).map(str::to_string);
+    // Antigravity names our server's tools `mcp_<server>_<tool>`; the approval policy knows them
+    // by their own names, and the server itself enforces their effects and consent.
+    if let Some(tool) = s("/name")
+        .and_then(|name| name.strip_prefix(&format!("mcp_{MCP_NAME}_")).or_else(|| name.strip_prefix(&format!("mcp__{MCP_NAME}__"))).map(str::to_string))
+    {
+        return (tool, call.get("rawInput").cloned().unwrap_or(Value::Null));
+    }
     let path =
         s("/locations/0/path").or_else(|| s("/rawInput/path")).or_else(|| s("/rawInput/file_path")).or_else(|| s("/rawInput/abs_path")).unwrap_or_default();
     let command = match call.pointer("/rawInput/command") {
@@ -422,7 +431,16 @@ impl AcpCore {
             }
             "tool_call" => {
                 let id = s("toolCallId");
-                let title = if s("title").is_empty() { s("kind") } else { s("title") };
+                // Our server's tools are named `mcp_<server>_<tool>` by some agents; show the
+                // tool's own name (its input still carries the detail).
+                let name = s("name");
+                let title = if name.starts_with(&format!("mcp_{MCP_NAME}_")) || name.starts_with(&format!("mcp__{MCP_NAME}__")) {
+                    super::short_tool(&name)
+                } else if s("title").is_empty() {
+                    s("kind")
+                } else {
+                    s("title")
+                };
                 self.tools.insert(id.clone(), title.clone());
                 let started = AgentEvent::ToolStarted { call_id: id.clone(), tool: title, input: u.get("rawInput").cloned().unwrap_or(Value::Null) };
                 return match finished(u, &id, self.tools.get(&id).cloned().unwrap_or_default()) {
@@ -834,6 +852,24 @@ mod tests {
     fn copilot_uses_stdio_acp() {
         assert_eq!(acp_args("copilot"), Some(["--acp", "--stdio"].as_slice()));
         assert!(acp_args("unknown-agent").is_none());
+    }
+
+    /// Antigravity's ACP mode names our server's tools `mcp_<server>_<tool>`. The approval policy
+    /// and the feed see the tool's own name, so a person recognizes what ran.
+    #[test]
+    fn antigravity_speaks_acp_and_our_tool_names_reach_the_policy() {
+        assert_eq!(acp_args("antigravity"), Some(["acp"].as_slice()));
+        assert_eq!(acp_args("agy"), Some(["acp"].as_slice()));
+        let call = json!({"name": "mcp_craft-anything_core_finding_add", "kind": "other", "title": "Run it", "rawInput": {"text": "x"}});
+        assert_eq!(policy_action(&call), ("core_finding_add".to_string(), json!({"text": "x"})));
+        let mut c = core(None);
+        let ev = events(c.line(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"t","name":"mcp_craft-anything_core_finding_add","title":"Run it","kind":"other","status":"pending","rawInput":{"text":"x"}}}}"#,
+        ));
+        assert!(matches!(&ev[..], [AgentEvent::ToolStarted { tool, .. }] if tool == "core_finding_add"));
+        // Another server's tool keeps its own spelling: its refusal is that server's business.
+        let other = json!({"name": "mcp_other_search", "title": "Search", "kind": "other"});
+        assert_eq!(policy_action(&other).0, "Search");
     }
 
     #[test]

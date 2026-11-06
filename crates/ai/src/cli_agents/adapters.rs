@@ -10,11 +10,13 @@ mod copilot;
 mod hermes;
 mod maki;
 mod opencode;
+mod qwen;
 pub use antigravity::Antigravity;
 pub use copilot::Copilot;
 pub use hermes::Hermes;
 pub use maki::Maki;
 pub use opencode::OpenCode;
+pub use qwen::QwenCode;
 
 /// What a run's arguments are built from.
 pub struct ArgsCx<'a> {
@@ -236,6 +238,7 @@ impl AgentAdapters {
                 Arc::new(ClaudeCode::default()),
                 Arc::new(Codex),
                 Arc::new(GeminiCli),
+                Arc::new(QwenCode),
                 Arc::new(OpenCode),
                 Arc::new(Antigravity),
                 Arc::new(Hermes),
