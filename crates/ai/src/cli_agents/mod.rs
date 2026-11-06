@@ -386,6 +386,9 @@ pub struct StreamParser {
     /// A missing or invalid per-step cost cannot become a complete turn total later.
     cost_incomplete: bool,
     pub saw_result: bool,
+    /// The current turn streamed answer text in fragments (`--include-partial-messages`), so the
+    /// completed assistant message's same text isn't shown a second time.
+    pub(crate) streamed_text: bool,
     /// The run was asked to continue a saved session the agent doesn't have (it lives on another
     /// computer, or under another folder), so it did nothing.
     pub session_missing: bool,
@@ -394,7 +397,12 @@ pub struct StreamParser {
 }
 
 fn short_tool(name: &str) -> String {
-    name.strip_prefix(&format!("mcp__{MCP_NAME}__")).or_else(|| name.strip_prefix(&format!("{MCP_NAME}__"))).unwrap_or(name).to_string()
+    name.strip_prefix(&format!("mcp__{MCP_NAME}__"))
+        .or_else(|| name.strip_prefix(&format!("{MCP_NAME}__")))
+        // Antigravity names an MCP server's tools `mcp_<server>_<tool>`.
+        .or_else(|| name.strip_prefix(&format!("mcp_{MCP_NAME}_")))
+        .unwrap_or(name)
+        .to_string()
 }
 
 fn find_evidence_id(text: &str) -> Option<String> {
@@ -434,6 +442,7 @@ impl StreamParser {
             cost_usd: None,
             cost_incomplete: false,
             saw_result: false,
+            streamed_text: false,
             session_missing: false,
             failure: None,
         }
@@ -1978,7 +1987,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         for supported in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let program = dir.path().join("agy");
+            let program = dir.path().join("test-native");
             let help = if supported { "--output-format stream-json" } else { "old command options" };
             let script = format!(
                 "#!/bin/sh\nd=$(dirname \"$0\")\nif [ \"$1\" = --help ]; then echo '{help}'; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$d/argv\"\necho run >> \"$d/runs\"\nexit 7\n"
@@ -1986,15 +1995,16 @@ mod tests {
             std::fs::write(&program, script).unwrap();
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
             let config = BackendConfig {
-                name: "Antigravity".into(),
+                name: "Test Native".into(),
                 kind: BackendKind::AgentCli,
-                model: "antigravity".into(),
+                model: "test-native".into(),
                 base_url: None,
                 ssh_host: None,
                 enabled: true,
             };
             let options = BackendOptions { command: Some(program.display().to_string()), ..Default::default() };
             let mut spec = CliSpec::new(config, options, false, None);
+            spec.adapters.register(Arc::new(TestNative));
             spec.preamble = Some("P:".into());
             spec.resume = Some("saved".into());
             let mut c = CliConversation::new(spec);
@@ -2337,6 +2347,32 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
         }
     }
 
+    /// A native agent with the three traits the retry test needs: required flags, a session it can
+    /// continue, and a plain form to fall back to. Antigravity used to stand in here before it
+    /// became ACP-only.
+    #[cfg(unix)]
+    struct TestNative;
+    #[cfg(unix)]
+    impl AgentAdapter for TestNative {
+        fn ids(&self) -> &'static [&'static str] {
+            &["test-native"]
+        }
+        fn args(&self, cx: &ArgsCx) -> Vec<String> {
+            let mut a = vec!["--output-format".to_string(), "stream-json".into()];
+            if let Some(r) = cx.resume {
+                a.extend(["--conversation".into(), r.to_string()]);
+            }
+            a.push(format!("{}{}", cx.preamble, cx.prompt));
+            a
+        }
+        fn required_flags(&self) -> (&'static [&'static str], &'static [&'static str]) {
+            (&["--help"], &["--output-format", "stream-json"])
+        }
+        fn resumes(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn a_registered_adapter_drives_its_agent_and_unknown_ones_get_plain() {
         let mut reg = AgentAdapters::built_in();
@@ -2347,10 +2383,15 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
         assert!(matches!(p.line(r#"{"say":"hello"}"#).as_slice(), [AgentEvent::TextDelta { text }] if text == "hello"));
         // Unknown agents stream their output as text; the built-ins keep their own adapters.
         assert!(!reg.for_agent("aider").streams_json());
-        assert!(reg.for_agent("claude").resumes() && !reg.for_agent("codex").resumes() && reg.for_agent("antigravity").resumes());
+        assert!(reg.for_agent("claude").resumes() && !reg.for_agent("codex").resumes());
+        assert!(reg.for_agent("qwen-code").resumes() && reg.for_agent("qwen-code").streams_json());
+        assert!(reg.for_agent("antigravity").requires_acp(), "Antigravity needs ACP to carry our tools");
         // Registering an adapter for an existing id replaces that one.
         reg.register(Arc::new(EchoAgent));
-        assert_eq!(format!("{reg:?}"), r#"["claude-code", "codex", "gemini-cli", "opencode", "antigravity", "hermes", "maki", "copilot", "echo-agent"]"#);
+        assert_eq!(
+            format!("{reg:?}"),
+            r#"["claude-code", "codex", "gemini-cli", "qwen-code", "opencode", "antigravity", "hermes", "maki", "copilot", "echo-agent"]"#
+        );
     }
 
     #[test]

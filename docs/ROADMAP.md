@@ -558,6 +558,22 @@ Owner: open · Status: in progress
       discovery, MCP-only tool restrictions, model selection and fresh read-only questions;
       unit tests and CLI 1.0.105 with an isolated home and loopback model, all five access modes
       — claimed: qu-gg, branch `feature/r2.2-copilot-integration` (recorded during PR preparation)
+- [x] Offer Qwen Code as a native agent with a real chat: stream-json messages, thinking, tool
+      calls and results, usage and resume; the prompt on stdin and our tool server supplied per run
+      with `--mcp-config`, so no settings file is rewritten and no API key is collected. Unit
+      tests cover both access modes and the stream; live Qwen Code 0.26.9 on Windows stopped at
+      Qwen's retired free OAuth tier, so a full answer and build are still owed. See
+      [Qwen Code](qwen.md). — claimed: esanchezpa, branch `feature/qwen-antigravity-agents`
+- [ ] Live-check a Qwen Code chat and build on an account with a Coding Plan or another provider
+- [x] Run Antigravity (`agy`) over ACP with the person's own Google or Gemini Enterprise sign-in
+      (no API key): the session carries Craft Anything's tool server, its model list feeds the
+      picker, and permission requests go through our approval policy. Its native print mode reads
+      the person's global `mcp_config.json`, so the adapter is ACP-only rather than rewriting it.
+      Live with CLI 1.5.2: a synthetic MCP tool was called and a command was refused through a
+      permission request. See [Antigravity](antigravity.md).
+      — claimed: esanchezpa, branch `feature/qwen-antigravity-agents`
+- [ ] Live-check a full Antigravity chat and build through the app, plus a `session/load` resume
+      on the same computer
 - [x] Review hardening: cap target handoff at 128 while preserving the active target; propagate
       context-discovery cancellation, normalize CLI-only efforts for Claude requests, and name
       the configured agent in shared picker warnings, with focused regressions and translations
@@ -633,9 +649,9 @@ Owner: open · Status: in progress
       code) and a refusal explains the fix (`docs/codex.md`)
 - [ ] Codex (#540): run `codex exec` on a real install and check `rebuild_start` gets through
 - [ ] Codex: resume support (`codex exec resume <id>`), verified on a real install
-- [ ] Every adapter but Claude Code's still takes the message in argv (`prompt_on_stdin`), so a long
-      one can pass Windows' command-line limit as Claude Code's did (#402); hand each its message on
-      stdin or in a file where its CLI reads one
+- [ ] Every native adapter but Claude Code's and Qwen Code's still takes the message in argv
+      (`prompt_on_stdin`), so a long one can pass Windows' command-line limit as Claude Code's did
+      (#402); hand each its message on stdin or in a file where its CLI reads one
 - [ ] A note sent during a build reaches the builder at its next step on other coding agents with
       tool hooks, and on the API-backend loop between tool calls (Claude Code only today)
 - [ ] Session copies for other agents that keep sessions (ACP agents' `session/load`) (#451)

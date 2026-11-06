@@ -1,7 +1,12 @@
-//! Antigravity (`agy`). Flags are checked against `agy --help`.
+//! Google Antigravity (`agy`), driven over ACP with our tool server rather than its own file and
+//! shell tools. Sign-in, credentials and session storage stay in Antigravity itself: a person signs
+//! in once with their Google account (or enterprise account) in the CLI, and no API key is
+//! involved unless they choose one there.
 //!
-//! Antigravity runs prompts non-interactively with `--output-format stream-json -p <prompt>`.
-//! In builder mode, `--dangerously-skip-permissions` is passed so tool requests proceed without prompting.
+//! The native `agy -p` run can't be handed a per-run MCP server without changing the person's
+//! global `mcp_config.json`, so Antigravity runs the way Copilot does: one ACP process, `session/new`
+//! carrying Craft Anything's server, permission requests decided by our approval policy, and
+//! `session/load` to continue a saved conversation.
 
 use super::*;
 
@@ -12,249 +17,147 @@ impl AgentAdapter for Antigravity {
         &["antigravity", "agy"]
     }
 
-    fn args(&self, cx: &ArgsCx) -> Vec<String> {
-        let mut a = cx.options.args.clone();
-        if cx.builder {
-            a.push("--dangerously-skip-permissions".into());
-        }
-        if let Some(m) = &cx.options.cli_model {
-            a.extend(["--model".into(), m.clone()]);
-        }
-        if let Some(r) = cx.resume {
-            a.extend(["--conversation".into(), r.to_string()]);
-        }
-        a.extend(["--output-format".into(), "stream-json".into(), "-p".into(), format!("{}{}", cx.preamble, cx.prompt)]);
-        a
-    }
-
-    fn required_flags(&self) -> (&'static [&'static str], &'static [&'static str]) {
-        (&["--help"], &["--output-format", "stream-json"])
-    }
-
-    fn streams_json(&self) -> bool {
+    /// The native runner has no way to add our tool server to one run, and a build without our
+    /// tools can't do the job. An explicit `acp = false` or an SSH host is refused with the fix,
+    /// not run without tools.
+    fn requires_acp(&self) -> bool {
         true
     }
 
-    fn resumes(&self) -> bool {
+    /// The native runner refuses `requires_acp` before it asks for arguments.
+    fn args(&self, _cx: &ArgsCx) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The models this account can run come from a fresh ACP session, not a fixed list.
+    fn has_model_catalog(&self) -> bool {
         true
     }
 
-    fn parse(&self, p: &mut StreamParser, v: &Value) -> Vec<AgentEvent> {
-        let mut out = Vec::new();
-        let event = v.get("event").and_then(Value::as_str).unwrap_or_default();
-        match event {
-            "init" => {
-                if let Some(id) = v.get("conversation_id").and_then(Value::as_str) {
-                    p.session_id = Some(id.to_string());
-                }
-            }
-            "step_update" => {
-                let Some(su) = v.get("step_update") else { return out };
-                if let Some(id) = su.get("conversation_id").and_then(Value::as_str) {
-                    p.session_id.get_or_insert_with(|| id.to_string());
-                }
-                let step_type = su.get("step_type").and_then(Value::as_str).unwrap_or_default();
-                let state = su.get("state").and_then(Value::as_str).unwrap_or_default();
-                match step_type {
-                    "agent_response" => {
-                        if let Some(text) = su.get("text_delta").and_then(Value::as_str).filter(|t| !t.is_empty()) {
-                            out.push(AgentEvent::TextDelta { text: text.to_string() });
-                        }
-                    }
-                    "tool" => {
-                        let id = su.get("step_index").map(|i| i.to_string()).unwrap_or_default();
-                        let name = su.get("tool_name").or_else(|| su.pointer("/tool_info/name")).and_then(Value::as_str).unwrap_or_default();
-                        if state == "ACTIVE" {
-                            let input = su.pointer("/tool_info/parameters").cloned().unwrap_or(Value::Null);
-                            out.push(p.started(&id, name, input));
-                        } else if state == "DONE" || state == "ERROR" {
-                            if !p.tool_names.contains_key(&id) {
-                                let input = su.pointer("/tool_info/parameters").cloned().unwrap_or(Value::Null);
-                                out.push(p.started(&id, name, input));
-                            }
-                            let ok = state != "ERROR" && su.pointer("/tool_info/error").is_none();
-                            let text = su.pointer("/tool_info/output").or_else(|| su.pointer("/tool_info/error")).map(content_text).unwrap_or_default();
-                            out.push(p.finished(&id, ok, &text));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            "result" => {
-                p.saw_result = true;
-                if let Some(res) = v.get("result") {
-                    if let Some(u) = res.get("usage") {
-                        let in_tok = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                        let cache_tok = u.get("cache_read_tokens").and_then(Value::as_u64).unwrap_or(0);
-                        p.input_tokens = in_tok.saturating_add(cache_tok);
-                        let out_tok = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-                        let think_tok = u.get("thinking_tokens").and_then(Value::as_u64).unwrap_or(0);
-                        p.output_tokens = out_tok.saturating_add(think_tok);
-                    }
-                    if res.get("status").and_then(Value::as_str) == Some("ERROR") {
-                        let why = res.get("error").or_else(|| res.get("response")).and_then(Value::as_str).unwrap_or("run failed");
-                        out.push(AgentEvent::Error { message: format!("Antigravity: {why}"), remediation: None, log: None });
-                    }
-                }
-            }
-            "error" => {
-                let msg = v.pointer("/error/message").or_else(|| v.get("error")).and_then(Value::as_str).unwrap_or("unknown error");
-                out.push(AgentEvent::Error { message: format!("Antigravity: {msg}"), remediation: None, log: None });
-            }
-            _ => {}
-        }
-        out
+    fn model_catalog(
+        &self,
+        config: &BackendConfig,
+        options: &BackendOptions,
+        directory: Option<&Path>,
+        stop: &Stop,
+    ) -> Result<Vec<models::AgentModel>, ToolError> {
+        let metadata = super::super::acp_model_metadata(config, options, directory, stop)?;
+        Ok(catalogue(&metadata))
     }
+
+    fn validate_model(&self, config: &BackendConfig, options: &BackendOptions, directory: Option<&Path>, stop: &Stop) -> Result<(), ToolError> {
+        stop.check()?;
+        self.validate_options(options)?;
+        if options.cli_model.is_none() {
+            return Ok(());
+        }
+        models::validate(options, &self.model_catalog(config, options, directory, stop)?)
+    }
+
+    fn model_choices(&self, config: &BackendConfig, options: &BackendOptions) -> Result<Vec<String>, ToolError> {
+        let metadata = super::super::acp_model_metadata(config, options, None, &Stop::default())?;
+        Ok(catalogue(&metadata).into_iter().map(|model| model.id).collect())
+    }
+
+    /// The model names Antigravity reports already carry their thinking level
+    /// (`gemini-3.8-flash-medium`), so there is no separate depth setting to offer.
+    fn supports_model_tuning(&self) -> bool {
+        false
+    }
+
+    fn model_in_use(&self, options: Option<&BackendOptions>) -> Option<String> {
+        Some(options.and_then(|options| options.cli_model.clone()).unwrap_or_else(|| "Antigravity default".into()))
+    }
+
+    /// A session can answer a question about a build: ACP permission requests go through the
+    /// read-only approver, so its writes, commands and fetches are refused.
+    fn answers_questions(&self) -> bool {
+        true
+    }
+
+    fn plain_fallback(&self) -> bool {
+        false
+    }
+
+    fn check_tool_server(&self, stop: &CancelToken) -> Result<(), ToolError> {
+        cli_can_start(craft_anything_platform::self_cli_path().as_deref(), stop)
+    }
+
+    /// Startup arguments before `acp`: the chosen model must come before the subcommand.
+    fn acp_options(&self, options: &BackendOptions, _access: Access) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(model) = options.cli_model.as_deref().map(str::trim).filter(|model| !model.is_empty()) {
+            args.extend(["--model".into(), model.into()]);
+        }
+        args
+    }
+
+    /// Extra arguments could auto-approve tools (`--dangerously-skip-permissions`) and bypass the
+    /// approval policy, so they're refused; settings the app understands are on the backend.
+    fn validate_options(&self, options: &BackendOptions) -> Result<(), ToolError> {
+        if options.args.is_empty() {
+            Ok(())
+        } else {
+            Err(ToolError::invalid("Extra Antigravity arguments could bypass Craft Anything's approvals.")
+                .with_remediation("Remove this backend's extra arguments. Choose its model in Settings → AI, and leave approvals to the app."))
+        }
+    }
+
+    fn sign_in_fix(&self) -> Option<String> {
+        Some("Sign in to Antigravity with your Google account: open a terminal and run `agy`, then try again. Antigravity keeps its credentials.".into())
+    }
+}
+
+/// The selectable models a fresh session reports, in the CLI's own order. Duplicates and empty ids
+/// are dropped: the running agent decides what this account may use.
+fn catalogue(metadata: &super::super::acp::ModelMetadata) -> Vec<models::AgentModel> {
+    let mut seen = std::collections::BTreeSet::new();
+    metadata
+        .models
+        .iter()
+        .filter(|id| !id.trim().is_empty() && seen.insert((*id).clone()))
+        .map(|id| models::AgentModel { id: id.clone(), name: id.clone(), thinking: Vec::new() })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn args(builder: bool, resume: Option<&str>, options: &BackendOptions) -> Vec<String> {
-        let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec!["mcp".into()], notes: None };
-        Antigravity.args(&ArgsCx { options, prompt: "analyse repo", preamble: "PRE ", mcp: &mcp, resume, builder, reads_checked: false, question: false })
-    }
-
     #[test]
-    fn antigravity_args_construction() {
-        let default_opts = BackendOptions::default();
-        assert_eq!(args(false, None, &default_opts), ["--output-format", "stream-json", "-p", "PRE analyse repo"]);
-
-        let builder_opts =
-            BackendOptions { cli_model: Some("Gemini 3.8 Flash (Medium)".into()), args: vec!["--add-dir".into(), "/repo".into()], ..Default::default() };
-        assert_eq!(
-            args(true, Some("conv-123"), &builder_opts),
-            [
-                "--add-dir",
-                "/repo",
-                "--dangerously-skip-permissions",
-                "--model",
-                "Gemini 3.8 Flash (Medium)",
-                "--conversation",
-                "conv-123",
-                "--output-format",
-                "stream-json",
-                "-p",
-                "PRE analyse repo"
-            ]
-        );
-        assert!(Antigravity.resumes());
-        assert_eq!(Antigravity.required_flags(), (&["--help"][..], &["--output-format", "stream-json"][..]));
+    fn antigravity_is_acp_only_and_never_runs_native() {
+        assert!(Antigravity.requires_acp() && !Antigravity.plain_fallback());
+        assert!(Antigravity.answers_questions());
         assert!(AgentAdapters::built_in().for_agent("antigravity").ids().contains(&"antigravity"));
         assert!(AgentAdapters::built_in().for_agent("agy").ids().contains(&"agy"));
+        assert_eq!(super::super::acp::acp_args("antigravity"), Some(["acp"].as_slice()));
+        assert_eq!(super::super::acp::acp_args("agy"), Some(["acp"].as_slice()));
     }
 
     #[test]
-    fn antigravity_stream_parsing() {
-        let adapter: Arc<dyn AgentAdapter> = Arc::new(Antigravity);
-        let mut p = StreamParser::new(adapter);
+    fn the_persons_model_goes_before_the_acp_subcommand_and_extra_arguments_are_refused() {
+        let options = BackendOptions { cli_model: Some("gemini-3.8-flash-medium".into()), ..Default::default() };
+        assert_eq!(Antigravity.acp_options(&options, Access::Build), ["--model", "gemini-3.8-flash-medium"]);
+        assert!(Antigravity.validate_options(&options).is_ok());
+        let extra = BackendOptions { args: vec!["--dangerously-skip-permissions".into()], ..Default::default() };
+        assert_eq!(Antigravity.validate_options(&extra).unwrap_err().code, craft_anything_evidence::ErrorCode::BadInput);
+    }
 
-        let init = json!({
-            "event": "init",
-            "conversation_id": "conv-456",
-            "init": {"cwd": "/tmp", "permission_mode": "always-proceed"}
-        });
-        assert!(p.line(&init.to_string()).is_empty());
-        assert_eq!(p.session_id.as_deref(), Some("conv-456"));
+    #[test]
+    fn the_catalogue_keeps_the_sessions_order_and_drops_duplicates() {
+        let metadata = super::super::acp::ModelMetadata {
+            models: vec!["gemini-3.8-flash-high".into(), "claude-sonnet-4-6".into(), "gemini-3.8-flash-high".into(), " ".into()],
+            current_model: "gemini-3.8-flash-high".into(),
+            config_options: Vec::new(),
+        };
+        let models = catalogue(&metadata);
+        assert_eq!(models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(), ["gemini-3.8-flash-high", "claude-sonnet-4-6"]);
+        assert!(models.iter().all(|model| model.thinking.is_empty()));
+    }
 
-        let text_step = json!({
-            "event": "step_update",
-            "step_update": {
-                "conversation_id": "conv-456",
-                "step_index": 1,
-                "state": "ACTIVE",
-                "step_type": "agent_response",
-                "text_delta": "Hello from Antigravity!"
-            }
-        });
-        let evs = p.line(&text_step.to_string());
-        assert_eq!(evs.len(), 1);
-        match &evs[0] {
-            AgentEvent::TextDelta { text } => assert_eq!(text, "Hello from Antigravity!"),
-            other => panic!("expected TextDelta, got {other:?}"),
-        }
-
-        let tool_active = json!({
-            "event": "step_update",
-            "step_update": {
-                "step_index": 2,
-                "state": "ACTIVE",
-                "step_type": "tool",
-                "tool_name": "run_command",
-                "tool_info": {
-                    "name": "run_command",
-                    "parameters": {"CommandLine": "cargo check"}
-                }
-            }
-        });
-        let evs = p.line(&tool_active.to_string());
-        assert_eq!(evs.len(), 1);
-        match &evs[0] {
-            AgentEvent::ToolStarted { call_id, tool, input } => {
-                assert_eq!(call_id, "2");
-                assert_eq!(tool, "run_command");
-                assert_eq!(input["CommandLine"], "cargo check");
-            }
-            other => panic!("expected ToolStarted, got {other:?}"),
-        }
-
-        let tool_done = json!({
-            "event": "step_update",
-            "step_update": {
-                "step_index": 2,
-                "state": "DONE",
-                "step_type": "tool",
-                "tool_name": "run_command",
-                "tool_info": {
-                    "name": "run_command",
-                    "parameters": {"CommandLine": "cargo check"},
-                    "output": "Finished dev profile"
-                }
-            }
-        });
-        let evs = p.line(&tool_done.to_string());
-        assert_eq!(evs.len(), 1);
-        match &evs[0] {
-            AgentEvent::ToolFinished { call_id, tool, ok, summary, .. } => {
-                assert_eq!(call_id, "2");
-                assert_eq!(tool, "run_command");
-                assert!(ok);
-                assert_eq!(summary, "Finished dev profile");
-            }
-            other => panic!("expected ToolFinished, got {other:?}"),
-        }
-
-        let result = json!({
-            "event": "result",
-            "result": {
-                "conversation_id": "conv-456",
-                "status": "SUCCESS",
-                "response": "Done!",
-                "usage": {
-                    "input_tokens": 100,
-                    "output_tokens": 50,
-                    "thinking_tokens": 10,
-                    "cache_read_tokens": 20,
-                    "total_tokens": 180
-                }
-            }
-        });
-        let evs = p.line(&result.to_string());
-        assert!(evs.is_empty());
-        assert!(p.saw_result);
-        assert_eq!(p.input_tokens, 120);
-        assert_eq!(p.output_tokens, 60);
-
-        let err = json!({
-            "event": "error",
-            "error": "authentication expired"
-        });
-        let evs = p.line(&err.to_string());
-        assert_eq!(evs.len(), 1);
-        match &evs[0] {
-            AgentEvent::Error { message, .. } => assert!(message.contains("authentication expired")),
-            other => panic!("expected Error, got {other:?}"),
-        }
+    #[test]
+    fn signing_in_stays_in_antigravity() {
+        let fix = Antigravity.sign_in_fix().unwrap();
+        assert!(fix.contains("agy") && fix.contains("Google") && !fix.to_ascii_lowercase().contains("api key"));
     }
 }
